@@ -106,7 +106,7 @@ correcting it and start training it.
 
 ## 📦 The output envelope
 
-The model wraps SQL in [**sentinel blocks**](https://github.com/Eth-Interchained/sentinel-blocks):
+The model wraps SQL in [**sentinel blocks**](https://github.com/AIASSISTSECURE/sentinel-blocks):
 
 ```
 <<<SQL>>>
@@ -146,6 +146,12 @@ invents `SUM(revenue)` every single time.
 
 ## 🔬 What's proven, right now
 
+> **New:** the execution backend is now NEDB, not standalone PostgreSQL.
+> `scripts/bootstrap_nedb.sh` starts the embedded engine's pgwire endpoint
+> and seeds the schema — no postgres install, no root, no socket paths.
+> The gate verifies against NEDB's time-traveling store, and the repo ships
+> with its data embedded.
+
 ```
 == sentinel envelope ==                    9/9   ✅
 == gate levels (live PostgreSQL 16) ==    24/24  ✅
@@ -174,6 +180,73 @@ fixture of mine on the very first run — the gate was right and my test was wro
 
 ---
 
+## 🧬 Imagine v1: teacher → verifier → student
+
+The model that ships is **not** the teacher.
+
+```text
+mistralai/Devstral-Small-2507        teacher; proposes harder SQL
+                 │
+                 ▼
+        PostgreSQL L0-L4 gate        truth authority
+                 │
+                 ▼
+   verified SQL + Imagine identity
+                 │
+                 ▼
+deepseek-ai/deepseek-coder-1.3b-instruct    canonical student base
+                 │
+                 ▼
+              Imagine                compact local model
+```
+
+The canonical v1 student is **DeepSeek-Coder-1.3B-Instruct**. Devstral is an
+optional corpus teacher only: its SQL never enters training unless the live
+database agrees with the deterministic reference at L4.
+
+### Build the v1 training corpus
+
+Template-only forging remains the zero-teacher baseline. To add Devstral
+proposals:
+
+```bash
+python scripts/forge_teacher.py \
+  --teacher mistralai/Devstral-Small-2507 \
+  --out corpus/sql_train.jsonl \
+  --rejects corpus/sql_rejects.jsonl
+
+python scripts/make_identity.py --out corpus/identity.jsonl
+
+python scripts/merge_corpus.py \
+  --out corpus/imagine_train.jsonl \
+  corpus/sql_train.jsonl corpus/identity.jsonl
+```
+
+Identity is deliberately small. It teaches the name **Imagine**, Interchained
+provenance, local-first purpose, schema-grounding, read-only behavior, and the
+refuse/clarify contract. SQL capability still comes overwhelmingly from the
+execution-gated corpus.
+
+### Train the student
+
+```bash
+bash scripts/train_imagine.sh
+```
+
+Override any component without editing the recipe:
+
+```bash
+STUDENT=deepseek-ai/deepseek-coder-1.3b-instruct \
+CORPUS=corpus/imagine_train.jsonl \
+OUT=runs/imagine-deepseek13-v1 \
+bash scripts/train_imagine.sh
+```
+
+The first checkpoint is still judged on the held-out schema with
+`stealth.evaluate`; training loss is not the product metric.
+
+---
+
 ## 🗺️ Status
 
 | component | state |
@@ -184,7 +257,7 @@ fixture of mine on the very first run — the gate was right and my test was wro
 | 🟢 Parallel corpus forge | **built · 2,027 candidates/sec on 2 cores · 19/19 poison fixtures** |
 | 🟢 Execution-accuracy eval | **built · 4/4 directions verified (oracle 100%, saboteur 0%)** |
 | 🟢 Training harness (A6000) | **built · bf16 · packed · FlashAttention-2 · full FT default** |
-| ⚪ Base-model bake-off | next — one afternoon, decides everything downstream |
+| 🟢 Canonical student base | **DeepSeek-Coder-1.3B-Instruct** |\n| 🟢 Optional teacher path | **Devstral Small 2507 → L4 execution gate** |\n| 🟡 Imagine v1 training | identity + verified SQL corpus ready to build |
 
 ### One command
 

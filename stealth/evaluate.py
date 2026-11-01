@@ -38,13 +38,48 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from stealth.forge import build_prompt, materialise, _swap_db      # noqa: E402
-from stealth.gate import Gate, Level                               # noqa: E402
+from stealth.forge import build_prompt, materialise, _swap_db, schema_catalog  # noqa: E402
+from stealth.gate import Gate, Level, check_parse                  # noqa: E402
 from stealth.schemas import CATALOG, HELDOUT_KEYS, TRAIN_KEYS, get  # noqa: E402
 from stealth.sentinel import extract_one                            # noqa: E402
 
 _NO_REL = re.compile(r'relation "([^"]+)" does not exist', re.I)
 _NO_COL = re.compile(r'column "?([^"\s]+)"? does not exist', re.I)
+
+_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+def _ansi(code: str, text: str) -> str:
+    return f"\x1b[{code}m{text}\x1b[0m" if _COLOR else text
+
+def _green(s: str) -> str: return _ansi("32;1", s)
+def _red(s: str) -> str: return _ansi("31;1", s)
+def _yellow(s: str) -> str: return _ansi("33;1", s)
+def _cyan(s: str) -> str: return _ansi("36;1", s)
+def _dim(s: str) -> str: return _ansi("2", s)
+def _magenta(s: str) -> str: return _ansi("35;1", s)
+
+def _preview(text: str, n: int = 220) -> str:
+    one = " ".join((text or "").strip().split())
+    return one if len(one) <= n else one[:n - 1] + "…"
+
+
+def _diagnostic_sql(text: str) -> str | None:
+    """Extract parseable raw SQL for baseline diagnostics only.
+
+    Strict execution accuracy still requires a valid sentinel block. This
+    helper lets us distinguish "model ignored the envelope" from "model cannot
+    write PostgreSQL" during student-base selection.
+    """
+    s = text.strip()
+    fenced = re.search(r"```(?:sql|postgresql)?\s*(.*?)```", s, re.I | re.S)
+    if fenced:
+        s = fenced.group(1).strip()
+    first = re.search(r"\b(SELECT|WITH)\b", s, re.I)
+    if first:
+        s = s[first.start():].strip()
+    if not re.match(r"^(SELECT|WITH)\b", s, re.I):
+        return None
+    ok, _, _ = check_parse(s)
+    return s if ok else None
 
 
 def load_eval_set(path: str) -> list[dict]:
@@ -61,8 +96,10 @@ def eval_rows(rows, generate, admin_dsn: str, style: str = "ddl",
     the metric changing underneath us.
     """
     gates: dict[str, Gate] = {}
-    tally = {"n": 0, "parseable": 0, "executable": 0, "correct": 0,
+    tally = {"n": 0, "parseable": 0, "raw_sql_parseable": 0,
+             "executable": 0, "correct": 0,
              "refusal": 0, "unparseable_block": 0,
+             "strict_protocol": 0, "protocol_extra_text": 0,
              "invented_relation": 0, "invented_column": 0, "wrong_answer": 0}
     per_schema: dict[str, dict[str, int]] = {}
     details = []
@@ -70,7 +107,7 @@ def eval_rows(rows, generate, admin_dsn: str, style: str = "ddl",
     for row in rows:
         key = row["schema_key"]
         if key not in gates:
-            g = Gate(_swap_db(admin_dsn, f"stealth_{key}"))
+            g = Gate(_swap_db(admin_dsn, f"stealth_{key}"), schema=schema_catalog(CATALOG[key]))
             g.connect()
             gates[key] = g
         gate = gates[key]
@@ -86,13 +123,39 @@ def eval_rows(rows, generate, admin_dsn: str, style: str = "ddl",
         blk = extract_one(text)
         if blk is None:
             tally["unparseable_block"] += 1
+            raw_sql = _diagnostic_sql(text)
+            if raw_sql is not None:
+                tally["raw_sql_parseable"] += 1
             details.append({**row, "verdict": "unparseable_block",
+                            "raw_sql_parseable": raw_sql is not None,
+                            "raw_sql": raw_sql,
                             "output": text[:300], "gen_ms": round(gen_ms)})
+            if verbose:
+                print(f"\n{_red('✗ PROTOCOL')} {_cyan(key)}  {_dim(f'{gen_ms:.0f} ms')}")
+                print(f"  {_magenta('Q')}   {row['question']}")
+                print(f"  {_yellow('OUT')} {_preview(text)}")
+                if raw_sql is not None:
+                    print(f"  {_green('RAW SQL PARSES')} {_preview(raw_sql)}")
+                else:
+                    print(f"  {_red('RAW SQL INVALID')} no parseable SELECT/WITH found")
             continue
+        strict_protocol = text.strip() == blk.raw.strip()
+        if strict_protocol:
+            tally["strict_protocol"] += 1
+        else:
+            tally["protocol_extra_text"] += 1
+            if verbose:
+                print(f"\n{_red('✗ PROTOCOL EXTRA TEXT')} {_cyan(key)}")
+                print(f"  {_yellow('OUT')} {_preview(text)}")
+
         if blk.kind != "SQL":
             tally["refusal"] += 1
             details.append({**row, "verdict": f"refusal:{blk.kind}",
                             "output": blk.payload[:200], "gen_ms": round(gen_ms)})
+            if verbose:
+                print(f"\n{_yellow('↪ REFUSAL')} {_cyan(key)}  {_dim(f'{gen_ms:.0f} ms')}")
+                print(f"  {_magenta('Q')}   {row['question']}")
+                print(f"  {_yellow(blk.kind)} {_preview(blk.payload)}")
             continue
 
         r = gate.run(blk.payload, reference_sql=row["reference_sql"])
@@ -120,8 +183,12 @@ def eval_rows(rows, generate, admin_dsn: str, style: str = "ddl",
         details.append({**row, "verdict": verdict, "sql": blk.payload,
                         "reason": r.reason, "gen_ms": round(gen_ms)})
         if verbose:
-            mark = "ok  " if verdict == "correct" else "FAIL"
-            print(f"  [{mark}] {key:10} {verdict:20} {row['question'][:52]}")
+            icon = _green("✓ CORRECT") if verdict == "correct" else _red("✗ FAIL")
+            print(f"\n{icon} {_cyan(key)}  {_dim(f'{gen_ms:.0f} ms')}  {_dim(f'gate={r.level.name}')}")
+            print(f"  {_magenta('Q')}   {row['question']}")
+            print(f"  {_cyan('SQL')} {_preview(blk.payload)}")
+            if verdict != "correct":
+                print(f"  {_red('WHY')} {_preview(r.reason, 300)}")
 
     for g in gates.values():
         g.close()
@@ -129,6 +196,8 @@ def eval_rows(rows, generate, admin_dsn: str, style: str = "ddl",
     n = max(tally["n"], 1)
     tally["execution_accuracy"] = round(tally["correct"] / n, 4)
     tally["parse_rate"] = round(tally["parseable"] / n, 4)
+    tally["raw_sql_parse_rate"] = round(tally["raw_sql_parseable"] / n, 4)
+    tally["protocol_compliance"] = round(tally["strict_protocol"] / n, 4)
     tally["execute_rate"] = round(tally["executable"] / n, 4)
     tally["per_schema"] = {
         k: {**v, "acc": round(v["correct"] / max(v["n"], 1), 4)}
@@ -140,24 +209,108 @@ def eval_rows(rows, generate, admin_dsn: str, style: str = "ddl",
 # ------------------------------------------------------------------ runners --
 
 def hf_generator(model_path: str, max_new: int = 256, device: str = "auto"):
+    """Load a Hugging Face causal LM and return generate(messages) -> text.
+
+    Ordinary HF instruct models use their tokenizer chat template. Devstral
+    checkpoints intentionally use Mistral's Tekken tokenizer through
+    mistral-common instead, so they get a dedicated, upstream-compatible path.
+
+    On CUDA, device_map="auto" lets Accelerate shard large checkpoints across
+    all visible GPUs instead of forcing the whole model onto cuda:0.
+    """
     import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    tok = AutoTokenizer.from_pretrained(model_path)
-    if tok.pad_token_id is None:
-        tok.pad_token = tok.eos_token
-    dev = ("cuda" if torch.cuda.is_available() else "cpu") if device == "auto" else device
-    dtype = torch.bfloat16 if (dev == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
-    m = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype,
-                                             low_cpu_mem_usage=True).to(dev).eval()
+    from transformers import AutoModelForCausalLM
+
+    from .tokenizer import load_tokenizer
+
+    want_cuda = torch.cuda.is_available() and device in ("auto", "cuda")
+    dtype = torch.bfloat16 if (want_cuda and torch.cuda.is_bf16_supported()) else torch.float32
+    load_kwargs = {"dtype": dtype, "low_cpu_mem_usage": True}
+    if device == "auto" and torch.cuda.is_available():
+        load_kwargs["device_map"] = "auto"
+
+    m = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs).eval()
+    if not (device == "auto" and torch.cuda.is_available()):
+        dev = ("cuda" if torch.cuda.is_available() else "cpu") if device == "auto" else device
+        m = m.to(dev)
+
+    # With a sharded model, inputs belong on the device holding the embedding
+    # layer. For ordinary single-device models this resolves to that same device.
+    input_device = m.get_input_embeddings().weight.device
+
+    if "devstral" in model_path.lower():
+        try:
+            from mistral_common.protocol.instruct.messages import SystemMessage, UserMessage
+            from mistral_common.protocol.instruct.request import ChatCompletionRequest
+            from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+        except ImportError as e:
+            raise RuntimeError(
+                "Devstral requires mistral-common>=1.7.0. "
+                "Install/update requirements.txt before evaluating."
+            ) from e
+
+        tok = MistralTokenizer.from_hf_hub(model_path)
+
+        def gen(messages):
+            converted = []
+            for msg in messages:
+                role = msg["role"]
+                if role == "system":
+                    converted.append(SystemMessage(content=msg["content"]))
+                elif role == "user":
+                    converted.append(UserMessage(content=msg["content"]))
+                else:
+                    raise ValueError(f"unsupported Devstral prompt role: {role!r}")
+
+            encoded = tok.encode_chat_completion(
+                ChatCompletionRequest(messages=converted)
+            )
+            input_ids = torch.tensor(
+                [encoded.tokens], dtype=torch.long, device=input_device
+            )
+            with torch.no_grad():
+                out = m.generate(
+                    input_ids=input_ids,
+                    max_new_tokens=max_new,
+                    do_sample=False,
+                )
+            return tok.decode(out[0][input_ids.shape[1]:].tolist())
+
+        return gen
+
+    tok = load_tokenizer(model_path)
+    backend_decoder = getattr(getattr(tok, "backend_tokenizer", None), "decoder", None)
+    print("* tokenizer diagnostics")
+    print(f"  class      {tok.__class__.__name__}")
+    print(f"  decoder    {backend_decoder}")
+    print("  roundtrip  OK")
 
     def gen(messages):
-        enc = tok.apply_chat_template(messages, tokenize=True,
-                                      add_generation_prompt=True,
-                                      return_dict=True, return_tensors="pt").to(dev)
+        if not tok.chat_template:
+            raise ValueError(
+                f"{model_path!r} does not expose tokenizer.chat_template. "
+                "Use a model-specific tokenizer path or --url with an "
+                "OpenAI-compatible server."
+            )
+        enc = tok.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(input_device)
         with torch.no_grad():
-            out = m.generate(**enc, max_new_tokens=max_new, do_sample=False,
-                             pad_token_id=tok.pad_token_id or tok.eos_token_id)
-        return tok.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
+            out = m.generate(
+                **enc,
+                max_new_tokens=max_new,
+                do_sample=False,
+                pad_token_id=tok.pad_token_id or tok.eos_token_id,
+            )
+        return tok.decode(
+            out[0][enc["input_ids"].shape[1]:],
+            skip_special_tokens=True,
+        )
+
     return gen
 
 
@@ -219,14 +372,23 @@ def main() -> int:
     t = res["tally"]
     json.dump(res, open(a.out, "w"), indent=2)
 
-    print(f"\n  parse rate          {t['parse_rate']:.1%}")
-    print(f"  execute rate        {t['execute_rate']:.1%}")
-    print(f"  EXECUTION ACCURACY  {t['execution_accuracy']:.1%}   <-- the metric")
+    print("\n" + _cyan("══════════════════ EVALUATION SUMMARY ══════════════════"))
+    protocol_s = f"{t['protocol_compliance']:.1%}"
+    parse_s = f"{t['parse_rate']:.1%}"
+    raw_s = f"{t['raw_sql_parse_rate']:.1%}"
+    exec_s = f"{t['execute_rate']:.1%}"
+    print(f"  protocol compliance {_yellow(protocol_s)}")
+    print(f"  strict parse rate   {_yellow(parse_s)}")
+    print(f"  raw SQL parse rate  {_cyan(raw_s)}  {_dim('(diagnostic only)')}")
+    print(f"  execute rate        {_yellow(exec_s)}")
+    acc = _green(f"{t['execution_accuracy']:.1%}") if t["execution_accuracy"] > 0 else _red(f"{t['execution_accuracy']:.1%}")
+    print(f"  EXECUTION ACCURACY  {acc}  {_dim('<-- the metric')}")
     print(f"  wrong answer        {t['wrong_answer']}")
     print(f"  invented relation   {t['invented_relation']}")
     print(f"  invented column     {t['invented_column']}")
     print(f"  refusals            {t['refusal']}")
     print(f"  unparseable block   {t['unparseable_block']}")
+    print(f"  protocol extra text {t['protocol_extra_text']}")
     print("\n  per schema:")
     for k, v in sorted(t["per_schema"].items()):
         flag = "  <- HELD OUT" if k in HELDOUT_KEYS else ""
